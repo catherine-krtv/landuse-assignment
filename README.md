@@ -24,7 +24,7 @@ GeoJSON file with assigned land uses
 Plots showing land use visualization and road networks
 
 # Contributing
-Contributions are welcome! Please open an issue or submit a pull request
+Contributions are welcome!
 
 # Contact
 For any questions or suggestions, please contact korotaeva.catherine@gmail.com
