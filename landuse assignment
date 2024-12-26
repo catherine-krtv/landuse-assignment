@@ -1,0 +1,369 @@
+import os
+import osmnx as ox
+import geopandas as gpd
+import shapely
+import matplotlib.pyplot as plt
+import pandas as pd
+from shapely.geometry import box
+import numpy as np
+from scipy.spatial import Voronoi
+from shapely.ops import unary_union
+import random
+import networkx as nx
+from shapely.geometry import LineString
+from shapely.geometry import MultiPolygon, Polygon
+import matplotlib.patches as mpatches
+
+# local crs for Leningrad region - 32636
+# if using google colab 
+local_crs = 32636
+data_path = '/content/'
+
+# splitting landplot om blocks
+# loading landplot without water objects in geojson
+landplot = gpd.read_file(os.path.join(data_path, 'landplot.geojson')).to_crs(local_crs)
+
+# making poly of the landplot
+landplot_poly = landplot.geometry[0]
+
+# setting random points on the landplot
+def generate_random_points(landplot_poly, num_points):
+    points = []
+    minx, miny, maxx, maxy = landplot_poly.bounds
+    while len(points) < num_points:
+        random_point = Point(np.random.uniform(minx, maxx), np.random.uniform(miny, maxy))
+            if landplot_poly.contains(random_point):
+            points.append(random_point)
+
+    return points
+
+# 190 random points
+random_points = generate_random_points(landplot_poly, 190)
+points_gdf = gpd.GeoDataFrame(geometry=random_points)
+
+# points on borders
+def generate_boundary_points(landplot_poly, num_points):
+    boundary_points = []
+    if isinstance(landplot_poly, MultiPolygon):
+        for sub_polygon in landplot_poly.geoms:
+            boundary = sub_polygon.exterior
+            boundary_length = boundary.length
+            distances = np.linspace(0, boundary_length, num_points // len(landplot_poly.geoms))
+            boundary_points.extend([boundary.interpolate(distance) for distance in distances])
+    elif isinstance(landplot_poly, Polygon):
+        boundary = landplot_poly.exterior
+        boundary_length = boundary.length
+        distances = np.linspace(0, boundary_length, num_points)
+        boundary_points = [boundary.interpolate(distance) for distance in distances]
+    else:
+        raise ValueError("Input must be a Polygon or MultiPolygon")
+
+    return boundary_points
+    
+    # 247 border points
+boundary_points = generate_boundary_points(landplot_poly, 247)
+
+# combining points
+all_points = random_points + boundary_points
+points_gdf = gpd.GeoDataFrame(geometry=all_points)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+landplot.boundary.plot(ax=ax, edgecolor="black")
+points_gdf.plot(ax=ax, color="red")
+plt.show()
+
+# Voronoi poly
+def create_voronoi_polygons(all_points, landplot_poly):
+    coords = np.array([point.coords[0] for point in all_points])
+    vor = Voronoi(coords)
+    voronoi_polygons = []
+    for region_index in vor.regions:
+        if not region_index or -1 in region_index:
+            continue
+        region_coords = [vor.vertices[i] for i in region_index]
+        polygon = Polygon(region_coords)
+        clipped_polygon = polygon.intersection(landplot_poly)
+        if not clipped_polygon.is_empty:
+            voronoi_polygons.append(clipped_polygon)
+    return voronoi_polygons
+
+voronoi_polygons = create_voronoi_polygons(all_points, landplot_poly)
+voronoi_gdf = gpd.GeoDataFrame(geometry=voronoi_polygons)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+gpd.GeoSeries(landplot_poly).plot(ax=ax, edgecolor='black', facecolor='none', linewidth=1)
+voronoi_gdf.plot(ax=ax, alpha=0.5, edgecolor='blue')
+points_gdf = gpd.GeoDataFrame(geometry=all_points)
+points_gdf.plot(ax=ax, color='red', markersize=10)
+plt.show()
+
+# uniting polys in one
+voronoi_union = unary_union(voronoi_gdf.geometry)
+
+# finding unfilled parts of landplot
+gaps = landplot_poly.difference(voronoi_union)
+
+# list of gaps
+gaps_list = []
+if isinstance(gaps, (Polygon, MultiPolygon)):
+    if gaps.is_empty:
+        print("No gaps found.")
+    elif gaps.geom_type == 'Polygon':
+        gaps_list = [gaps]
+    elif gaps.geom_type == 'MultiPolygon':
+        gaps_list = list(gaps.geoms)
+
+if gaps_list:
+    gaps_gdf = gpd.GeoDataFrame(geometry=gaps_list)
+voronoi_gdf = pd.concat([voronoi_gdf, gaps_gdf], ignore_index=True)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+voronoi_gdf.plot(ax=ax, facecolor='lightblue', edgecolor='blue')
+gpd.GeoSeries(landplot_poly).plot(ax=ax, edgecolor='black', facecolor='none', linewidth=1)
+plt.show
+
+# setting rules for landuse assignment
+# rule 1: if there are existing residential buildings, the residential landuse is assigned
+# loading file with existing residential buildings
+housing = gpd.read_file(os.path.join(data_path, 'housing.geojson')).to_crs(local_crs)
+for index, block in blocks_gdf.iterrows():
+    if housing.geometry.intersects(block.geometry).any():
+        blocks_gdf.at[index, 'land_use'] = 'RESIDENTIAL'
+
+# rule 2: neighbouring rules
+block_sindex = blocks_gdf.sindex
+def check_neighbors(block, assigned_use):
+    neighbors = blocks_gdf[blocks_gdf.geometry.touches(block.geometry)]
+    incompatible_neighbors = {
+        'RESIDENTIAL': ['INDUSTRIAL', 'SPECIAL'],
+        'INDUSTRIAL': ['RESIDENTIAL', 'AGRICULTURE'],
+        'AGRICULTURE': ['INDUSTRIAL', 'SPECIAL'],
+        'SPECIAL': ['RESIDENTIAL', 'AGRICULTURE']
+    }
+    for _, neighbor in neighbors.iterrows():
+        if neighbor['land_use'] in incompatible_neighbors.get(assigned_use, []):
+            return False
+    return True
+
+# rule 3: zone limits
+MAX_LAND_USE = {
+    'RECREATION': 20,
+    'SPECIAL': 5,
+    'INDUSTRIAL' : 3,
+    'AGRICULTURE' : 4,
+    'BUSINESS' : 70
+    }
+
+# setting proportions
+land_use_distribution = {
+    'RESIDENTIAL': 0.71,
+    'BUSINESS': 0.13,
+    'RECREATION': 0.18,
+    'INDUSTRIAL': 0.03,
+    'AGRICULTURE': 0.02,
+    'SPECIAL': 0.04
+}
+
+# function for landuse assignment
+def assign_land_use():
+    unassigned_blocks = blocks_gdf[blocks_gdf['land_use'].isna()].index.tolist()
+    total_blocks = len(unassigned_blocks)
+    assigned_count = {
+        k: min(int(v * total_blocks), MAX_LAND_USE.get(k, float('inf')))
+        for k, v in land_use_distribution.items()
+    }
+    for land_use, count in assigned_count.items():
+        assigned = 0
+        for idx in unassigned_blocks:
+            if assigned >= count:
+                break
+            block = blocks_gdf.loc[idx]
+            if check_neighbors(block, land_use):  # Ensure neighbor compatibility
+                blocks_gdf.at[idx, 'land_use'] = land_use
+                assigned += 1
+
+# rule 4: mandatory zones (mandatory zones could be chosen optionally)
+def assign_mandatory_zones():
+    # сельское хозяйство
+    agriculture_blocks = blocks_gdf[blocks_gdf['land_use'].isna()].sample(frac=land_use_distribution['AGRICULTURE'])
+    blocks_gdf.loc[agriculture_blocks.index, 'land_use'] = 'AGRICULTURE'
+
+    # индустриальные зоны
+    industrial_blocks = blocks_gdf[blocks_gdf['land_use'].isna()].sample(frac=land_use_distribution['INDUSTRIAL'])
+    blocks_gdf.loc[industrial_blocks.index, 'land_use'] = 'INDUSTRIAL'
+
+    # рекреация
+    industrial_blocks = blocks_gdf[blocks_gdf['land_use'].isna()].sample(frac=land_use_distribution['RECREATION'])
+    blocks_gdf.loc[industrial_blocks.index, 'land_use'] = 'RECREATION'
+assign_mandatory_zones()
+
+assign_land_use()
+blocks_gdf['land_use'] = blocks_gdf['land_use'].fillna('BUSINESS')
+
+residential_blocks = blocks_gdf[blocks_gdf['land_use'] == 'RESIDENTIAL']
+industrial_blocks = blocks_gdf[blocks_gdf['land_use'] == 'INDUSTRIAL']
+
+# resolving conflicts between residential and industrial areas
+conflicts = []
+for res_idx, res_row in residential_blocks.iterrows():
+    for ind_idx, ind_row in industrial_blocks.iterrows():
+        if res_row.geometry.touches(ind_row.geometry):
+            conflicts.append((res_idx, ind_idx))
+
+for res_idx, ind_idx in conflicts:
+    print(f"Conflict detected between RESIDENTIAL block {res_idx} and INDUSTRIAL block {ind_idx}")
+    blocks_gdf.loc[res_idx, 'land_use'] = 'BUSINESS'
+
+# colors according general plan
+land_use_colors = {
+    'RESIDENTIAL': '#FF3133',
+    'BUSINESS': '#ff00c6',
+    'RECREATION': '#54958f',
+    'INDUSTRIAL': '#885a43',
+    'AGRICULTURE': '#fffe9a',
+    'SPECIAL': '#304e07',
+}
+blocks_gdf['color'] = blocks_gdf['land_use'].map(land_use_colors)
+
+fig, ax = plt.subplots(figsize=(10, 10))
+blocks_gdf.plot(ax=ax, color=blocks_gdf['color'])
+
+handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10)
+           for color in land_use_colors.values()]
+labels = list(land_use_colors.keys())
+ax.legend(handles=handles, labels=labels, title="Land Use Types", loc="upper right")
+ax.set_title("Land Use Zones")
+ax.set_axis_off()
+plt.show()
+
+def random_assign_land_use():
+    unassigned_blocks = blocks_gdf[blocks_gdf['land_use'].isna()].index.tolist()
+    random.shuffle(unassigned_blocks)  # Shuffle to assign randomly
+    for idx in unassigned_blocks:
+        block = blocks_gdf.loc[idx]
+        blocks_gdf.at[idx, 'land_use'] = random.choice(list(land_use_distribution.keys()))
+random_assign_land_use()
+print(blocks_gdf['land_use'].value_counts())
+
+# if we want to redo assignment we need to null the landuse
+# blocks_gdf['land_use'] = None
+
+# building roads for transport zoning
+# merging blocks to generate roads efficiantly
+blocks_gdf['geometry'] = blocks_gdf['geometry'].buffer(0)
+buffer_blocks = blocks_gdf
+buffer_blocks['geometry'] = buffer_blocks['geometry'].buffer(2)
+merged_blocks = []
+for land_use, subset in buffer_blocks.groupby('land_use'):
+    subset = subset.reset_index(drop=True)
+    sindex = subset.sindex
+    seen = set()
+    for i, geom in subset.geometry.items():
+        if i in seen:
+            continue
+        possible_matches = list(sindex.query(geom, predicate='intersects'))
+        merged_geom = unary_union(subset.geometry.iloc[possible_matches])
+        merged_blocks.append({'land_use': land_use, 'geometry': merged_geom})
+        seen.update(possible_matches)
+merged_blocks_gdf = gpd.GeoDataFrame(merged_blocks, crs=blocks_gdf.crs)
+
+fig, ax = plt.subplots(figsize=(12, 12))
+merged_blocks_gdf.plot(ax=ax, column='land_use', legend=True, cmap='tab20', edgecolor='black')
+plt.title('Merged Blocks by Land Use (Spatial Index Method)')
+plt.show()
+
+roads = []
+distance_threshold = 1  # Adjust the threshold as needed
+
+for i, merged_block in merged_blocks_gdf.iterrows():
+    merged_geom = merged_block.geometry
+
+    road_buffer = merged_geom.buffer(distance_threshold)
+    road = road_buffer.boundary
+
+    if road.is_valid:
+        roads.append(road)
+roads_gdf = gpd.GeoDataFrame({'geometry': roads}, crs=blocks_gdf.crs)
+
+fig, ax = plt.subplots(figsize=(12, 12))
+merged_blocks_gdf.plot(ax=ax, color='lightgrey')
+roads_gdf.plot(ax=ax, color='red')
+plt.title('Road Network Around Merged Blocks')
+plt.show()
+
+roads_poly=roads_gdf.buffer(7)
+fig, ax = plt.subplots(figsize=(12, 12))
+merged_blocks_gdf.plot(ax=ax, color='lightgrey')
+roads_poly.plot(ax=ax, color='red')
+plt.title('Road Network Around Merged Blocks')
+plt.show()
+
+roads_poly_u = unary_union(roads_poly.geometry)
+road_poly_u_gdf = gpd.GeoDataFrame(geometry=gpd.GeoSeries(roads_poly_u), crs=roads_gdf.crs)
+
+fig, ax = plt.subplots(figsize=(8, 8))
+road_poly_u_gdf.plot(ax=ax, facecolor='blue', edgecolor='black', label='Roads')
+plt.legend()
+plt.show()
+
+# assigning transport landuse for roads poly
+road_poly_u_gdf['land_use'] = 'TRANSPORT'
+
+fig, ax = plt.subplots(figsize=(8, 8))
+road_poly_u_gdf.plot(ax=ax, facecolor='#006a92', edgecolor='black', label='Roads (TRANSPORT)')
+
+# uniting transport landuse with other landuse blocks 
+overlay = gpd.overlay(blocks_gdf, road_poly_u_gdf, how='intersection')
+overlay['land_use'] = 'TRANSPORT'
+blocks_no_roads = gpd.overlay(blocks_gdf, road_poly_u_gdf, how='difference')
+final_blocks_gdf = pd.concat([blocks_no_roads, overlay], ignore_index=True)
+
+land_use_colors = {
+    'RESIDENTIAL': '#FF3133',
+    'BUSINESS': '#ff00c6',
+    'RECREATION': '#54958f',
+    'INDUSTRIAL': '#885a43',
+    'AGRICULTURE': '#fffe9a',
+    'SPECIAL': '#304e07',
+    'TRANSPORT': '#006a92'
+}
+
+land_use_edge_colors = {
+    'RESIDENTIAL': '#FF3133',
+    'BUSINESS': '#ff00c6',
+    'RECREATION': '#54958f',
+    'SPECIAL': '#885a43',
+    'INDUSTRIAL': '#fffe9a',
+    'AGRICULTURE': '#304e07',
+    'TRANSPORT': '#006a92'
+}
+
+land_use_edge_widths = {
+    'RESIDENTIAL': 0,
+    'BUSINESS': 0,
+    'RECREATION': 0,
+    'SPECIAL':0,
+    'INDUSTRIAL': 0,
+    'AGRICULTURE': 0,
+    'TRANSPORT': 0.1
+}
+
+fig, ax = plt.subplots(figsize=(15, 15))
+
+for land_use, color in land_use_colors.items():
+    edge_color = land_use_edge_colors.get(land_use, 'black')
+    edge_width = land_use_edge_widths.get(land_use, 1.0)
+    subset = final_blocks_gdf[final_blocks_gdf['land_use'] == land_use]
+    subset.plot(ax=ax,
+                facecolor=color,
+                edgecolor=edge_color,
+                linewidth=edge_width)
+legend_patches = [mpatches.Patch(facecolor=land_use_colors[land_use],
+                                 edgecolor=land_use_edge_colors[land_use],
+                                 linewidth=land_use_edge_widths[land_use],
+                                 label=land_use)
+                  for land_use in land_use_colors.keys()]
+ax.legend(handles=legend_patches, loc='upper right', title='Land Use Types')
+ax.axis('off')
+plt.title('Land Use Blocks with Specific Edge Colors and Edge Widths', fontsize=16)
+plt.show()
