@@ -4,10 +4,10 @@ This project focuses on generating, assigning, and analyzing land use zones for 
 The project utilizes Python with GeoPandas and other spatial libraries to manage, analyze, and visualize geospatial data.
 
 # Features
-Landplot splitting: Splitting one landplot on many smaller ones for future designing and assigning
-Adjacency rules: Strict spatial rules to prevent incompatible land use neighbors
-Land use assignment: Proportional distribution of land use types based on predefined ratios
-Road network generation: Create road networks based on land use zones
+Landplot splitting: Splitting one landplot on many smaller ones for future designing and assigning;
+Adjacency rules: Strict spatial rules to prevent incompatible land use neighbors;
+Land use assignment: Proportional distribution of land use types based on predefined ratios;
+Road network generation: Create road networks based on land use zones;
 Spatial visualization: Clear visualization with distinct colors and edge styles for each land use type according to the general plan
 
 # Usage
